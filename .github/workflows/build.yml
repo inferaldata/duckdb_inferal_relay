@@ -67,13 +67,11 @@ jobs:
 
             # Upload versioned: /{NAME}/{EXT_VERSION}/{DUCKDB_VERSION}/{PLATFORM}/{NAME}.duckdb_extension.gz
             aws s3 cp "$GZ_FILE" \
-              "s3://${BUCKET}/${EXT_NAME}/${EXT_VERSION}/${DUCKDB_VERSION}/${platform}/${EXT_NAME}.duckdb_extension.gz" \
-              --no-sign-request=false
+              "s3://${BUCKET}/${EXT_NAME}/${EXT_VERSION}/${DUCKDB_VERSION}/${platform}/${EXT_NAME}.duckdb_extension.gz"
 
             # Upload latest: /{DUCKDB_VERSION}/{PLATFORM}/{NAME}.duckdb_extension.gz
             aws s3 cp "$GZ_FILE" \
-              "s3://${BUCKET}/${DUCKDB_VERSION}/${platform}/${EXT_NAME}.duckdb_extension.gz" \
-              --no-sign-request=false
+              "s3://${BUCKET}/${DUCKDB_VERSION}/${platform}/${EXT_NAME}.duckdb_extension.gz"
 
             echo "Deployed: $platform (versioned: ${EXT_VERSION}, latest)"
           done
