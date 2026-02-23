@@ -10,8 +10,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build extension binaries
+  build-v1_4_0:
+    name: Build (DuckDB v1.4.0)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.0
+    with:
+      duckdb_version: v1.4.0
+      ci_tools_version: v1.4.0
+      extension_name: inferal_relay
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+
+  build-v1_4_1:
+    name: Build (DuckDB v1.4.1)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.1
+    with:
+      duckdb_version: v1.4.1
+      ci_tools_version: v1.4.1
+      extension_name: inferal_relay
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+
+  build-v1_4_2:
+    name: Build (DuckDB v1.4.2)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.2
+    with:
+      duckdb_version: v1.4.2
+      ci_tools_version: v1.4.2
+      extension_name: inferal_relay
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+
+  build-v1_4_3:
+    name: Build (DuckDB v1.4.3)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.3
+    with:
+      duckdb_version: v1.4.3
+      ci_tools_version: v1.4.3
+      extension_name: inferal_relay
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+
+  build-v1_4_4:
+    name: Build (DuckDB v1.4.4)
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
     with:
       duckdb_version: v1.4.4
@@ -21,7 +57,7 @@ jobs:
 
   deploy:
     name: Deploy to R2
-    needs: build
+    needs: [build-v1_4_0, build-v1_4_1, build-v1_4_2, build-v1_4_3, build-v1_4_4]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -41,17 +77,19 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
         run: |
-          DUCKDB_VERSION="v1.4.4"
           EXT_NAME="inferal_relay"
           EXT_VERSION="${GITHUB_REF#refs/tags/v}"
           BUCKET="${{ secrets.R2_BUCKET_NAME }}"
 
           for artifact_dir in artifacts/*/; do
             dir_name=$(basename "$artifact_dir")
-            platform="${dir_name#${EXT_NAME}-${DUCKDB_VERSION}-extension-}"
 
-            # Skip non-extension artifacts
-            if [ "$platform" = "$dir_name" ]; then
+            # Extract DuckDB version and platform from artifact name
+            # Pattern: {EXT_NAME}-{DUCKDB_VERSION}-extension-{PLATFORM}
+            if [[ "$dir_name" =~ ^${EXT_NAME}-(v[0-9]+\.[0-9]+\.[0-9]+)-extension-(.+)$ ]]; then
+              DUCKDB_VERSION="${BASH_REMATCH[1]}"
+              platform="${BASH_REMATCH[2]}"
+            else
               echo "Skipping: $dir_name"
               continue
             fi
@@ -73,5 +111,5 @@ jobs:
             aws s3 cp "$GZ_FILE" \
               "s3://${BUCKET}/${DUCKDB_VERSION}/${platform}/${EXT_NAME}.duckdb_extension.gz"
 
-            echo "Deployed: $platform (versioned: ${EXT_VERSION}, latest)"
+            echo "Deployed: ${DUCKDB_VERSION}/${platform} (versioned: ${EXT_VERSION}, latest)"
           done
