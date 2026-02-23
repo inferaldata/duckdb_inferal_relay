@@ -1,7 +1,7 @@
 name: Build & Deploy Extension
 on:
   push:
-    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -20,65 +20,60 @@ jobs:
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
 
   deploy:
-    name: Deploy to GitHub Pages
+    name: Deploy to R2
     needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Arrange extension repository layout
+      - name: Install AWS CLI
+        run: pip install awscli
+
+      - name: Deploy to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
         run: |
           DUCKDB_VERSION="v1.4.4"
-          mkdir -p site
+          EXT_NAME="inferal_relay"
+          EXT_VERSION="${GITHUB_REF#refs/tags/}"
+          BUCKET="${{ secrets.R2_BUCKET_NAME }}"
 
           for artifact_dir in artifacts/*/; do
             dir_name=$(basename "$artifact_dir")
+            platform="${dir_name#${EXT_NAME}-${DUCKDB_VERSION}-extension-}"
 
-            # Extract platform from artifact name: inferal_relay-v1.4.4-extension-{platform}
-            platform="${dir_name#inferal_relay-${DUCKDB_VERSION}-extension-}"
-
-            # Skip non-extension artifacts (test results, etc.)
+            # Skip non-extension artifacts
             if [ "$platform" = "$dir_name" ]; then
-              echo "Skipping non-extension artifact: $dir_name"
+              echo "Skipping: $dir_name"
               continue
             fi
 
-            target_dir="site/${DUCKDB_VERSION}/${platform}"
-            mkdir -p "$target_dir"
-
-            # Find the extension file and gzip it
-            ext_file=$(find "$artifact_dir" -name "inferal_relay.duckdb_extension" -type f | head -1)
-            if [ -n "$ext_file" ]; then
-              gzip -9 -k "$ext_file"
-              cp "${ext_file}.gz" "$target_dir/inferal_relay.duckdb_extension.gz"
-              echo "Deployed: $platform -> $target_dir"
-            else
-              echo "Warning: no extension file found in $artifact_dir"
+            ext_file=$(find "$artifact_dir" -name "${EXT_NAME}.duckdb_extension" -type f | head -1)
+            if [ -z "$ext_file" ]; then
+              echo "Warning: no extension in $artifact_dir"
+              continue
             fi
+
+            gzip -9 -k "$ext_file"
+            GZ_FILE="${ext_file}.gz"
+
+            # Upload versioned: /{NAME}/{EXT_VERSION}/{DUCKDB_VERSION}/{PLATFORM}/{NAME}.duckdb_extension.gz
+            aws s3 cp "$GZ_FILE" \
+              "s3://${BUCKET}/${EXT_NAME}/${EXT_VERSION}/${DUCKDB_VERSION}/${platform}/${EXT_NAME}.duckdb_extension.gz" \
+              --no-sign-request=false
+
+            # Upload latest: /{DUCKDB_VERSION}/{PLATFORM}/{NAME}.duckdb_extension.gz
+            aws s3 cp "$GZ_FILE" \
+              "s3://${BUCKET}/${DUCKDB_VERSION}/${platform}/${EXT_NAME}.duckdb_extension.gz" \
+              --no-sign-request=false
+
+            echo "Deployed: $platform (versioned: ${EXT_VERSION}, latest)"
           done
-
-          # List what we deployed
-          find site -type f | sort
-
-      - name: Add CNAME
-        run: echo "duckdb.relay.inferal.com" > site/CNAME
-
-      - name: Upload pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
