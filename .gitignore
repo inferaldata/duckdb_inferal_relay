@@ -1,0 +1,6 @@
+# Auto-cloned dependencies (not committed)
+duckdb/
+extension-ci-tools/
+build/
+*.duckdb
+*.wal

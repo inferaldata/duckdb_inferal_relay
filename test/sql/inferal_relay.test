@@ -1,0 +1,337 @@
+# name: test/sql/inferal_relay.test
+# description: Test inferal_relay extension core functionality
+# group: [inferal_relay]
+
+require inferal_relay
+
+require json
+
+# Extension loads and version works
+query I
+SELECT inferal_relay_version();
+----
+0.1.0
+
+# ============================================================================
+# Schema creation (lazy, triggered by first function call)
+# ============================================================================
+
+# Schema and tables created on first use
+statement ok
+SELECT inferal_relay_add_stream('test-stream', 'https://relay.inferal.com', 'acme', 'snapshots', 100);
+
+# Tables exist
+query I
+SELECT count(*) FROM inferal_relay.streams WHERE name = 'test-stream';
+----
+1
+
+# Cursor auto-created
+query I
+SELECT count(*) FROM inferal_relay.cursors WHERE stream_name = 'test-stream';
+----
+1
+
+# Cursor starts empty
+query I
+SELECT last_event_id IS NULL FROM inferal_relay.cursors WHERE stream_name = 'test-stream';
+----
+true
+
+# Default values
+query II
+SELECT facet, page_limit FROM inferal_relay.streams WHERE name = 'test-stream';
+----
+snapshots	100
+
+# ============================================================================
+# Stream management
+# ============================================================================
+
+# Add another stream
+statement ok
+SELECT inferal_relay_add_stream('test-stream-2', 'https://relay.inferal.com/', 'corp', 'snapshots', 50);
+
+query I
+SELECT count(*) FROM inferal_relay.streams;
+----
+2
+
+# Remove stream
+statement ok
+SELECT inferal_relay_remove_stream('test-stream-2');
+
+query I
+SELECT count(*) FROM inferal_relay.streams;
+----
+1
+
+# ============================================================================
+# URL builder
+# ============================================================================
+
+# Initial URL (no cursor)
+query I
+SELECT inferal_relay_build_next_url('test-stream');
+----
+https://relay.inferal.com/streams/acme/snapshots?limit=100
+
+# ============================================================================
+# Status table function
+# ============================================================================
+
+query IIIII
+SELECT name, base_url, stream_id, facet, page_limit
+FROM inferal_relay_status('test-stream');
+----
+test-stream	https://relay.inferal.com	acme	snapshots	100
+
+# ============================================================================
+# Ingest page (external sync path)
+# ============================================================================
+
+# Ingest a page with 2 members + a tree:relation
+query IIII
+SELECT members_received, next_event_id, next_partition_hint, has_more
+FROM inferal_relay_ingest_page('test-stream', '{
+    "@context": {
+        "@vocab": "https://schema.org/",
+        "tree": "https://w3id.org/tree#",
+        "relay": "https://relay.inferal.com/ontology#",
+        "prov": "https://www.w3.org/ns/prov#",
+        "sameAs": "http://schema.org/sameAs",
+        "fileCount": {"@id": "relay:fileCount", "@type": "xsd:integer"},
+        "name": {"@id": "http://schema.org/name"}
+    },
+    "tree:member": [
+        {
+            "@id": "urn:entity:1",
+            "relay:eventId": "018f0001-0000-7000-8000-000000000001",
+            "prov:generatedAtTime": {"@value": "2026-01-27T12:00:00Z", "@type": "xsd:dateTime"},
+            "relay:path": "us-east/prod",
+            "name": "Entity One"
+        },
+        {
+            "@id": "urn:entity:2",
+            "relay:eventId": "018f0001-0000-7000-8000-000000000002",
+            "prov:generatedAtTime": {"@value": "2026-01-27T12:01:00Z", "@type": "xsd:dateTime"},
+            "relay:path": "us-east/prod",
+            "name": "Entity Two"
+        }
+    ],
+    "tree:relation": [{
+        "@type": "tree:GreaterThanRelation",
+        "tree:node": "/streams/acme/snapshots?since=018f0001-0000-7000-8000-000000000002&_p=0.abcd",
+        "tree:path": {"@id": "relay:eventId"},
+        "tree:value": {"@value": "018f0001-0000-7000-8000-000000000002", "@type": "xsd:string"}
+    }]
+}');
+----
+2	018f0001-0000-7000-8000-000000000002	0.abcd	true
+
+# Members stored
+query I
+SELECT count(*) FROM inferal_relay.members WHERE stream_name = 'test-stream';
+----
+2
+
+# Member fields extracted correctly
+query III
+SELECT member_id, member_path, event_id
+FROM inferal_relay.members
+WHERE event_id = '018f0001-0000-7000-8000-000000000001';
+----
+urn:entity:1	us-east/prod	018f0001-0000-7000-8000-000000000001
+
+# Cursor advanced
+query I
+SELECT last_event_id FROM inferal_relay.cursors WHERE stream_name = 'test-stream';
+----
+018f0001-0000-7000-8000-000000000002
+
+# URL now includes since parameter
+query I
+SELECT inferal_relay_build_next_url('test-stream');
+----
+https://relay.inferal.com/streams/acme/snapshots?since=018f0001-0000-7000-8000-000000000002&_p=0.abcd&limit=100
+
+# ============================================================================
+# Deduplication: re-ingest same page → no new members
+# ============================================================================
+
+query I
+SELECT members_received
+FROM inferal_relay_ingest_page('test-stream', '{
+    "tree:member": [
+        {
+            "@id": "urn:entity:1",
+            "relay:eventId": "018f0001-0000-7000-8000-000000000001"
+        },
+        {
+            "@id": "urn:entity:2",
+            "relay:eventId": "018f0001-0000-7000-8000-000000000002"
+        }
+    ]
+}');
+----
+0
+
+# Still 2 members total
+query I
+SELECT count(*) FROM inferal_relay.members WHERE stream_name = 'test-stream';
+----
+2
+
+# ============================================================================
+# Ingest page with no relation (last page)
+# ============================================================================
+
+query II
+SELECT members_received, has_more
+FROM inferal_relay_ingest_page('test-stream', '{
+    "tree:member": [
+        {
+            "@id": "urn:entity:3",
+            "relay:eventId": "018f0001-0000-7000-8000-000000000003",
+            "prov:generatedAtTime": "2026-01-27T12:02:00Z",
+            "relay:path": "us-west/staging"
+        }
+    ]
+}');
+----
+1	false
+
+# Now 3 members total
+query I
+SELECT count(*) FROM inferal_relay.members WHERE stream_name = 'test-stream';
+----
+3
+
+# ============================================================================
+# Context storage verification
+# ============================================================================
+
+# Context deduplicated by hash (first ingest had context, second had same → 1 row)
+query I
+SELECT count(*) FROM inferal_relay.contexts WHERE stream_name = 'test-stream';
+----
+1
+
+# context_terms populated
+query I
+SELECT count(*) FROM inferal_relay.context_terms ct
+JOIN inferal_relay.contexts c ON c.id = ct.context_id
+WHERE c.stream_name = 'test-stream';
+----
+7
+
+# @vocab stored
+query II
+SELECT term, iri FROM inferal_relay.context_terms ct
+JOIN inferal_relay.contexts c ON c.id = ct.context_id
+WHERE c.stream_name = 'test-stream' AND ct.term = '@vocab';
+----
+@vocab	https://schema.org/
+
+# Prefix stored
+query III
+SELECT term, iri, term_type FROM inferal_relay.context_terms ct
+JOIN inferal_relay.contexts c ON c.id = ct.context_id
+WHERE c.stream_name = 'test-stream' AND ct.term = 'relay';
+----
+relay	https://relay.inferal.com/ontology#	prefix
+
+# fileCount expanded from compact IRI
+query II
+SELECT term, iri FROM inferal_relay.context_terms ct
+JOIN inferal_relay.contexts c ON c.id = ct.context_id
+WHERE c.stream_name = 'test-stream' AND ct.term = 'fileCount';
+----
+fileCount	https://relay.inferal.com/ontology#fileCount
+
+# name from expanded definition
+query II
+SELECT term, iri FROM inferal_relay.context_terms ct
+JOIN inferal_relay.contexts c ON c.id = ct.context_id
+WHERE c.stream_name = 'test-stream' AND ct.term = 'name';
+----
+name	http://schema.org/name
+
+# ============================================================================
+# resolve_term()
+# ============================================================================
+
+# Prefix expansion
+query I
+SELECT inferal_relay_resolve_term('test-stream', 'relay:eventId');
+----
+https://relay.inferal.com/ontology#eventId
+
+# @vocab fallback for bare term
+query I
+SELECT inferal_relay_resolve_term('test-stream', 'description');
+----
+https://schema.org/description
+
+# Exact match for expanded term
+query I
+SELECT inferal_relay_resolve_term('test-stream', 'fileCount');
+----
+https://relay.inferal.com/ontology#fileCount
+
+# ============================================================================
+# Reset cursor
+# ============================================================================
+
+statement ok
+SELECT inferal_relay_reset_cursor('test-stream');
+
+query I
+SELECT last_event_id IS NULL FROM inferal_relay.cursors WHERE stream_name = 'test-stream';
+----
+true
+
+# Pages fetched counter reset
+query I
+SELECT pages_fetched FROM inferal_relay.cursors WHERE stream_name = 'test-stream';
+----
+0
+
+# ============================================================================
+# CHECK constraints
+# ============================================================================
+
+# Bad URL
+statement error
+SELECT inferal_relay_add_stream('bad-url', 'ftp://invalid', 'acme', 'snapshots', 100);
+----
+Invalid Input Error: base_url must start with http:// or https://
+
+# Page limit too low
+statement error
+SELECT inferal_relay_add_stream('bad-limit', 'https://example.com', 'acme', 'snapshots', 0);
+----
+Invalid Input Error: page_limit must be between 1 and 10000
+
+# Page limit too high
+statement error
+SELECT inferal_relay_add_stream('bad-limit-high', 'https://example.com', 'acme', 'snapshots', 10001);
+----
+Invalid Input Error: page_limit must be between 1 and 10000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+SELECT inferal_relay_remove_stream('test-stream');
+
+query I
+SELECT count(*) FROM inferal_relay.streams;
+----
+0
+
+query I
+SELECT count(*) FROM inferal_relay.members;
+----
+0

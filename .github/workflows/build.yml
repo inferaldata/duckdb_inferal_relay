@@ -1,0 +1,93 @@
+name: Build & Deploy Extension
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build extension binaries
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
+    with:
+      duckdb_version: v1.4.4
+      extension_name: inferal_relay
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Arrange extension repository layout
+        run: |
+          DUCKDB_VERSION="v1.4.4"
+          mkdir -p site
+
+          # Map artifact directory names to DuckDB platform names
+          declare -A PLATFORM_MAP=(
+            ["linux_amd64"]="linux_amd64"
+            ["linux_amd64_gcc4"]="linux_amd64_gcc4"
+            ["linux_arm64"]="linux_arm64"
+            ["osx_amd64"]="osx_amd64"
+            ["osx_arm64"]="osx_arm64"
+            ["windows_amd64"]="windows_amd64"
+            ["windows_amd64_mingw"]="windows_amd64_mingw"
+          )
+
+          for artifact_dir in artifacts/*/; do
+            dir_name=$(basename "$artifact_dir")
+
+            # Extract platform from artifact name: inferal_relay-v1.4.4-extension-{platform}
+            platform="${dir_name#inferal_relay-${DUCKDB_VERSION}-extension-}"
+
+            if [ -z "${PLATFORM_MAP[$platform]+_}" ]; then
+              echo "Skipping unknown platform: $platform"
+              continue
+            fi
+
+            target_dir="site/${DUCKDB_VERSION}/${PLATFORM_MAP[$platform]}"
+            mkdir -p "$target_dir"
+
+            # Find the extension file and gzip it
+            ext_file=$(find "$artifact_dir" -name "inferal_relay.duckdb_extension" -type f | head -1)
+            if [ -n "$ext_file" ]; then
+              gzip -9 -k "$ext_file"
+              cp "${ext_file}.gz" "$target_dir/inferal_relay.duckdb_extension.gz"
+              echo "Deployed: $platform -> $target_dir"
+            else
+              echo "Warning: no extension file found in $artifact_dir"
+            fi
+          done
+
+          # List what we deployed
+          find site -type f | sort
+
+      - name: Add CNAME
+        run: echo "duckdb.relay.inferal.com" > site/CNAME
+
+      - name: Upload pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
