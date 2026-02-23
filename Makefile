@@ -1,8 +1,5 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-# DuckDB version to build against
-DUCKDB_VERSION ?= v1.4.4
-
 # Parallel build (cmake respects this env var)
 export CMAKE_BUILD_PARALLEL_LEVEL ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
@@ -28,24 +25,8 @@ endif
 EXT_NAME=inferal_relay
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
-# Auto-clone DuckDB and extension-ci-tools if not present
-duckdb/.git:
-	git clone --depth=1 --branch $(DUCKDB_VERSION) https://github.com/duckdb/duckdb.git duckdb
-
-extension-ci-tools/.git:
-	git clone --depth=1 https://github.com/duckdb/extension-ci-tools.git extension-ci-tools
-
-.PHONY: deps
-deps: duckdb/.git extension-ci-tools/.git
-
-# Include the Makefile from extension-ci-tools (must exist before make parses it)
-# We use a conditional include so the first `make deps` works
--include extension-ci-tools/makefiles/duckdb_extension.Makefile
-
-# Override release/debug to depend on deps
-release: deps
-debug: deps
-test: deps
+# Include the Makefile from extension-ci-tools
+include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # Developer workflow targets
 DB ?=
@@ -57,7 +38,3 @@ ifdef DB
 else
 	./build/release/duckdb -unsigned -cmd "LOAD 'build/release/extension/inferal_relay/inferal_relay.duckdb_extension';"
 endif
-
-.PHONY: clean-deps
-clean-deps:
-	rm -rf duckdb extension-ci-tools
