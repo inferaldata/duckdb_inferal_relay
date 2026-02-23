@@ -17,7 +17,7 @@ jobs:
       duckdb_version: v1.4.4
       ci_tools_version: v1.4.4
       extension_name: inferal_relay
-      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;linux_amd64_musl'
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
 
   deploy:
     name: Deploy to GitHub Pages
@@ -42,29 +42,19 @@ jobs:
           DUCKDB_VERSION="v1.4.4"
           mkdir -p site
 
-          # Map artifact directory names to DuckDB platform names
-          declare -A PLATFORM_MAP=(
-            ["linux_amd64"]="linux_amd64"
-            ["linux_amd64_gcc4"]="linux_amd64_gcc4"
-            ["linux_arm64"]="linux_arm64"
-            ["osx_amd64"]="osx_amd64"
-            ["osx_arm64"]="osx_arm64"
-            ["windows_amd64"]="windows_amd64"
-            ["windows_amd64_mingw"]="windows_amd64_mingw"
-          )
-
           for artifact_dir in artifacts/*/; do
             dir_name=$(basename "$artifact_dir")
 
             # Extract platform from artifact name: inferal_relay-v1.4.4-extension-{platform}
             platform="${dir_name#inferal_relay-${DUCKDB_VERSION}-extension-}"
 
-            if [ -z "${PLATFORM_MAP[$platform]+_}" ]; then
-              echo "Skipping unknown platform: $platform"
+            # Skip non-extension artifacts (test results, etc.)
+            if [ "$platform" = "$dir_name" ]; then
+              echo "Skipping non-extension artifact: $dir_name"
               continue
             fi
 
-            target_dir="site/${DUCKDB_VERSION}/${PLATFORM_MAP[$platform]}"
+            target_dir="site/${DUCKDB_VERSION}/${platform}"
             mkdir -p "$target_dir"
 
             # Find the extension file and gzip it
