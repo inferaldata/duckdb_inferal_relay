@@ -43,7 +43,7 @@ jobs:
         run: |
           DUCKDB_VERSION="v1.4.4"
           EXT_NAME="inferal_relay"
-          EXT_VERSION="${GITHUB_REF#refs/tags/}"
+          EXT_VERSION="${GITHUB_REF#refs/tags/v}"
           BUCKET="${{ secrets.R2_BUCKET_NAME }}"
 
           for artifact_dir in artifacts/*/; do
