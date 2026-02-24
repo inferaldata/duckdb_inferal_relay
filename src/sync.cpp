@@ -263,7 +263,7 @@ static void ResolveTermFn(DataChunk &args, ExpressionState &state, Vector &resul
 // Scalar function: inferal_relay_version
 // ============================================================================
 static void VersionFn(DataChunk &args, ExpressionState &state, Vector &result) {
-	result.SetValue(0, Value("0.1.0"));
+	result.SetValue(0, Value(EXT_VERSION_INFERAL_RELAY));
 }
 
 // ============================================================================
