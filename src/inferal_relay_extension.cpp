@@ -25,11 +25,7 @@ std::string InferalRelayExtension::Name() {
 }
 
 std::string InferalRelayExtension::Version() const {
-#ifdef EXT_VERSION_INFERAL_RELAY
 	return EXT_VERSION_INFERAL_RELAY;
-#else
-	return "0.1.0";
-#endif
 }
 
 } // namespace duckdb

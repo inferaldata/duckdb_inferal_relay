@@ -5,6 +5,9 @@ set(TARGET_NAME inferal_relay)
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
+set(EXT_VERSION_INFERAL_RELAY "0.2.0")
+add_compile_definitions(EXT_VERSION_INFERAL_RELAY="${EXT_VERSION_INFERAL_RELAY}")
+
 project(${TARGET_NAME})
 include_directories(src/include)
 
