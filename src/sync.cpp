@@ -7,6 +7,7 @@
 #include "context.hpp"
 #include "members.hpp"
 
+#include <atomic>
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
@@ -30,6 +31,10 @@ struct IngestResult {
 	string next_event_id;
 	string next_partition_hint;
 	bool has_more;
+	// Progress hints from server (-1 = not available)
+	int64_t remaining_items = -1;
+	bool sealed = false;
+	int32_t remaining_partitions = 0;
 };
 
 static IngestResult IngestPageInternal(ClientContext &context, const string &stream_name,
@@ -54,6 +59,9 @@ static IngestResult IngestPageInternal(ClientContext &context, const string &str
 	result.next_event_id = parsed.next_event_id;
 	result.next_partition_hint = parsed.next_partition_hint;
 	result.has_more = parsed.has_more;
+	result.remaining_items = parsed.remaining_items;
+	result.sealed = parsed.sealed;
+	result.remaining_partitions = parsed.remaining_partitions;
 
 	// Load current cursor to get fallback last_event_id
 	auto &db = DatabaseInstance::GetDatabase(context);
@@ -351,6 +359,22 @@ struct SyncBindData : public FunctionData {
 
 struct SyncGlobalState : public GlobalTableFunctionState {
 	bool done = false;
+	// Row accumulator: each page produces one row
+	struct Row {
+		int32_t page_num;
+		int32_t members_on_page;
+		string last_event_id;
+		bool has_more;
+		string status;
+		string error_msg;
+	};
+	vector<Row> rows;
+	idx_t row_offset = 0; // for multi-chunk emission
+
+	// Progress tracking (written by scan thread, read by background progress thread)
+	std::atomic<int64_t> items_fetched{0};
+	std::atomic<int64_t> estimated_total_items{0};
+	std::atomic<int32_t> pages_fetched{0};
 };
 
 static unique_ptr<FunctionData> SyncBind(ClientContext &context, TableFunctionBindInput &input,
@@ -381,11 +405,50 @@ static unique_ptr<GlobalTableFunctionState> SyncInitGlobal(ClientContext &contex
 	return make_uniq<SyncGlobalState>();
 }
 
+static double SyncProgress(ClientContext &context, const FunctionData *bind_data_p,
+                           const GlobalTableFunctionState *global_state_p) {
+	auto &bind_data = bind_data_p->Cast<SyncBindData>();
+	auto &gstate = global_state_p->Cast<SyncGlobalState>();
+
+	// Mode 1: server-provided item counts (relay:progress)
+	auto total = gstate.estimated_total_items.load();
+	if (total > 0) {
+		auto fetched = gstate.items_fetched.load();
+		return MinValue<double>(100.0 * static_cast<double>(fetched) / static_cast<double>(total), 100.0);
+	}
+
+	// Mode 2: page-based fallback (linear against max_pages)
+	if (bind_data.max_pages > 0) {
+		auto pages = gstate.pages_fetched.load();
+		return MinValue<double>(100.0 * static_cast<double>(pages) / static_cast<double>(bind_data.max_pages), 100.0);
+	}
+
+	return 0.0;
+}
+
 static void SyncScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<SyncBindData>();
 	auto &gstate = data.global_state->Cast<SyncGlobalState>();
 
+	// Second+ calls: emit accumulated rows
 	if (gstate.done) {
+		if (gstate.row_offset >= gstate.rows.size()) {
+			return; // no more rows
+		}
+		// Emit a batch of rows from the accumulator
+		idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, gstate.rows.size() - gstate.row_offset);
+		output.SetCardinality(count);
+		for (idx_t i = 0; i < count; i++) {
+			auto &row = gstate.rows[gstate.row_offset + i];
+			output.SetValue(0, i, Value(bind_data.stream_name));
+			output.SetValue(1, i, Value::INTEGER(row.page_num));
+			output.SetValue(2, i, Value::INTEGER(row.members_on_page));
+			output.SetValue(3, i, row.last_event_id.empty() ? Value(LogicalType::VARCHAR) : Value(row.last_event_id));
+			output.SetValue(4, i, Value::BOOLEAN(row.has_more));
+			output.SetValue(5, i, Value(row.status));
+			output.SetValue(6, i, row.error_msg.empty() ? Value(LogicalType::VARCHAR) : Value(row.error_msg));
+		}
+		gstate.row_offset += count;
 		return;
 	}
 	gstate.done = true;
@@ -404,19 +467,26 @@ static void SyncScan(ClientContext &context, TableFunctionInput &data, DataChunk
 	auto &stream_mat = Materialize(stream_result);
 
 	if (stream_mat.HasError() || stream_mat.RowCount() == 0) {
+		gstate.rows.push_back({0, 0, "", false, "error",
+		                       "Stream \"" + stream_name + "\" not found"});
+		// Emit immediately
 		output.SetCardinality(1);
+		auto &row = gstate.rows[0];
 		output.SetValue(0, 0, Value(stream_name));
 		output.SetValue(1, 0, Value::INTEGER(0));
 		output.SetValue(2, 0, Value::INTEGER(0));
 		output.SetValue(3, 0, Value(LogicalType::VARCHAR));
 		output.SetValue(4, 0, Value::BOOLEAN(false));
 		output.SetValue(5, 0, Value("error"));
-		output.SetValue(6, 0, Value("Stream \"" + stream_name + "\" not found"));
+		output.SetValue(6, 0, Value(row.error_msg));
+		gstate.row_offset = gstate.rows.size();
 		return;
 	}
 
 	bool enabled = stream_mat.GetValue(4, 0).GetValue<bool>();
 	if (!enabled) {
+		gstate.rows.push_back({0, 0, "", false, "error",
+		                       "Stream \"" + stream_name + "\" is disabled"});
 		output.SetCardinality(1);
 		output.SetValue(0, 0, Value(stream_name));
 		output.SetValue(1, 0, Value::INTEGER(0));
@@ -424,7 +494,8 @@ static void SyncScan(ClientContext &context, TableFunctionInput &data, DataChunk
 		output.SetValue(3, 0, Value(LogicalType::VARCHAR));
 		output.SetValue(4, 0, Value::BOOLEAN(false));
 		output.SetValue(5, 0, Value("error"));
-		output.SetValue(6, 0, Value("Stream \"" + stream_name + "\" is disabled"));
+		output.SetValue(6, 0, Value(gstate.rows[0].error_msg));
+		gstate.row_offset = gstate.rows.size();
 		return;
 	}
 
@@ -470,11 +541,8 @@ static void SyncScan(ClientContext &context, TableFunctionInput &data, DataChunk
 
 	try {
 		while (has_more && total_pages < max_pages) {
-			// Build URL
 			auto url = BuildNextUrlDirect(base_url, stream_id, facet, page_limit,
 			                               last_event_id, partition_hint);
-
-			// Fetch page
 			auto response = HttpGet(url, api_key);
 
 			if (response.status_code != 200) {
@@ -484,7 +552,6 @@ static void SyncScan(ClientContext &context, TableFunctionInput &data, DataChunk
 				throw InvalidInputException("HTTP %d from %s", response.status_code, url);
 			}
 
-			// Ingest page
 			auto ingest = IngestPageInternal(context, stream_name, response.body);
 
 			total_pages++;
@@ -496,9 +563,31 @@ static void SyncScan(ClientContext &context, TableFunctionInput &data, DataChunk
 			}
 
 			has_more = ingest.has_more;
+
+			// Update progress atomics (read by background progress thread)
+			if (ingest.remaining_items >= 0) {
+				int64_t extra_items = 0;
+				if (ingest.sealed && ingest.remaining_partitions > 0 && ingest.remaining_items > 0) {
+					extra_items = ingest.remaining_partitions * ingest.remaining_items;
+				}
+				int64_t total_items = total_members + ingest.remaining_items + extra_items;
+				gstate.estimated_total_items.store(total_items);
+				gstate.items_fetched.store(total_members);
+			}
+			gstate.pages_fetched.store(total_pages);
+
+			// Accumulate row (per-page stats)
+			gstate.rows.push_back({total_pages, static_cast<int32_t>(ingest.members_received),
+			                       last_event_id, has_more,
+			                       has_more ? "syncing" : "completed", ""});
 		}
 
-		// Update sync log as completed
+		// Mark last row as completed
+		if (!gstate.rows.empty()) {
+			gstate.rows.back().status = "completed";
+		}
+
+		// Update sync log
 		con.Query(
 		    "UPDATE inferal_relay.sync_log "
 		    "SET finished_at = current_timestamp, pages_fetched = $2, "
@@ -508,6 +597,7 @@ static void SyncScan(ClientContext &context, TableFunctionInput &data, DataChunk
 
 	} catch (std::exception &e) {
 		error_msg = e.what();
+		gstate.rows.push_back({total_pages, 0, last_event_id, false, "error", error_msg});
 		con.Query(
 		    "UPDATE inferal_relay.sync_log "
 		    "SET finished_at = current_timestamp, pages_fetched = $2, "
@@ -517,14 +607,23 @@ static void SyncScan(ClientContext &context, TableFunctionInput &data, DataChunk
 		    log_id, total_pages, total_members, last_event_id, error_msg);
 	}
 
-	output.SetCardinality(1);
-	output.SetValue(0, 0, Value(stream_name));
-	output.SetValue(1, 0, Value::INTEGER(total_pages));
-	output.SetValue(2, 0, Value::INTEGER(total_members));
-	output.SetValue(3, 0, last_event_id.empty() ? Value(LogicalType::VARCHAR) : Value(last_event_id));
-	output.SetValue(4, 0, Value::BOOLEAN(has_more));
-	output.SetValue(5, 0, Value(error_msg.empty() ? "completed" : "error"));
-	output.SetValue(6, 0, error_msg.empty() ? Value(LogicalType::VARCHAR) : Value(error_msg));
+	// Emit first batch of accumulated rows
+	if (gstate.rows.empty()) {
+		return;
+	}
+	idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, gstate.rows.size());
+	output.SetCardinality(count);
+	for (idx_t i = 0; i < count; i++) {
+		auto &row = gstate.rows[i];
+		output.SetValue(0, i, Value(stream_name));
+		output.SetValue(1, i, Value::INTEGER(row.page_num));
+		output.SetValue(2, i, Value::INTEGER(row.members_on_page));
+		output.SetValue(3, i, row.last_event_id.empty() ? Value(LogicalType::VARCHAR) : Value(row.last_event_id));
+		output.SetValue(4, i, Value::BOOLEAN(row.has_more));
+		output.SetValue(5, i, Value(row.status));
+		output.SetValue(6, i, row.error_msg.empty() ? Value(LogicalType::VARCHAR) : Value(row.error_msg));
+	}
+	gstate.row_offset = count;
 }
 
 // ============================================================================
@@ -799,12 +898,14 @@ void RegisterFunctions(ExtensionLoader &loader) {
 	TableFunction sync_fn("inferal_relay_sync",
 	                        {LogicalType::VARCHAR, LogicalType::INTEGER},
 	                        SyncScan, SyncBind, SyncInitGlobal);
+	sync_fn.table_scan_progress = SyncProgress;
 	loader.RegisterFunction(sync_fn);
 
 	// Also register a 1-arg variant of sync (default max_pages=100)
 	TableFunction sync_fn_1("inferal_relay_sync",
 	                          {LogicalType::VARCHAR},
 	                          SyncScan, SyncBind, SyncInitGlobal);
+	sync_fn_1.table_scan_progress = SyncProgress;
 	loader.RegisterFunction(sync_fn_1);
 
 	TableFunction status_fn("inferal_relay_status",

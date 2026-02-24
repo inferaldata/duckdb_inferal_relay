@@ -20,6 +20,11 @@ struct ParsedResponse {
 	string next_partition_hint;
 	bool has_more;
 	string context_json; // raw JSON string of @context, empty if null/string
+
+	// Progress hints from relay:progress (optional, -1 = absent)
+	int64_t remaining_items = -1;
+	bool sealed = false;
+	int32_t remaining_partitions = 0;
 };
 
 //! Parse an LDES JSON-LD response body.

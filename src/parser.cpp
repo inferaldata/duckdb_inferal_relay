@@ -156,6 +156,23 @@ ParsedResponse ProcessResponse(const string &response_body) {
 		result.has_more = true;
 	}
 
+	// Extract relay:progress (optional progress hints)
+	yyjson_val *progress_val = yyjson_obj_get(root, "relay:progress");
+	if (progress_val && yyjson_is_obj(progress_val)) {
+		yyjson_val *ri = yyjson_obj_get(progress_val, "relay:remainingItems");
+		if (ri && yyjson_is_int(ri)) {
+			result.remaining_items = yyjson_get_sint(ri);
+		}
+		yyjson_val *sl = yyjson_obj_get(progress_val, "relay:sealed");
+		if (sl && yyjson_is_bool(sl)) {
+			result.sealed = yyjson_get_bool(sl);
+		}
+		yyjson_val *rp = yyjson_obj_get(progress_val, "relay:remainingPartitions");
+		if (rp && yyjson_is_int(rp)) {
+			result.remaining_partitions = yyjson_get_int(rp);
+		}
+	}
+
 	yyjson_doc_free(doc);
 	return result;
 }
