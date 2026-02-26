@@ -110,9 +110,8 @@ static MaterializedQueryResult &Materialize(unique_ptr<QueryResult> &result) {
 	return result->Cast<MaterializedQueryResult>();
 }
 
-int64_t UpsertContext(ClientContext &context, const string &stream_name, const string &context_json) {
-	EnsureSchema(context);
-
+int64_t UpsertContext(Connection &con, ClientContext &context, const string &stream_name, const string &context_json) {
+	// Check existing
 	string normalized = NormalizeContext(context_json);
 	if (normalized.empty()) {
 		return -1;
@@ -120,10 +119,6 @@ int64_t UpsertContext(ClientContext &context, const string &stream_name, const s
 
 	string hash = ComputeMD5(normalized);
 
-	auto &db = DatabaseInstance::GetDatabase(context);
-	Connection con(db);
-
-	// Check existing
 	auto existing = con.Query(
 	    "SELECT id FROM inferal_relay.contexts "
 	    "WHERE stream_name = $1 AND context_hash = $2",
@@ -281,6 +276,13 @@ int64_t UpsertContext(ClientContext &context, const string &stream_name, const s
 
 	yyjson_doc_free(doc);
 	return ctx_id;
+}
+
+int64_t UpsertContext(ClientContext &context, const string &stream_name, const string &context_json) {
+	EnsureSchema(context);
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection con(db);
+	return UpsertContext(con, context, stream_name, context_json);
 }
 
 string ResolveTerm(ClientContext &context, const string &stream_name, const string &term, int64_t context_id) {

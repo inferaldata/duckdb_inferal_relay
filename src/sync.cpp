@@ -45,48 +45,75 @@ static IngestResult IngestPageInternal(ClientContext &context, const string &str
 	result.members_received = 0;
 	result.has_more = false;
 
-	// Parse response
+	// Parse response first: invalid payloads must fail before any writes.
 	auto parsed = ProcessResponse(response_body);
 
-	// Upsert context
-	int64_t context_id = -1;
-	if (!parsed.context_json.empty()) {
-		context_id = UpsertContext(context, stream_name, parsed.context_json);
-	}
-
-	// Store members
-	result.members_received = StoreMembers(context, stream_name, parsed.members, context_id);
-	result.next_event_id = parsed.next_event_id;
-	result.next_partition_hint = parsed.next_partition_hint;
-	result.has_more = parsed.has_more;
-	result.remaining_items = parsed.remaining_items;
-	result.sealed = parsed.sealed;
-	result.remaining_partitions = parsed.remaining_partitions;
-
-	// Load current cursor to get fallback last_event_id
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection con(db);
 
-	auto cursor = con.Query(
-	    "SELECT last_event_id FROM inferal_relay.cursors WHERE stream_name = $1",
-	    stream_name);
-	auto &cursor_mat = Materialize(cursor);
-	string current_event_id;
-	if (!cursor_mat.HasError() && cursor_mat.RowCount() > 0 && !cursor_mat.GetValue(0, 0).IsNull()) {
-		current_event_id = cursor_mat.GetValue(0, 0).ToString();
-	}
+	con.Query("BEGIN TRANSACTION");
+	try {
+		// Validate stream and cursor existence before any writes.
+		auto stream = con.Query(
+		    "SELECT 1 FROM inferal_relay.streams WHERE name = $1",
+		    stream_name);
+		auto &stream_mat = Materialize(stream);
+		if (stream_mat.HasError() || stream_mat.RowCount() == 0) {
+			throw InvalidInputException("Stream \"%s\" not found", stream_name);
+		}
 
-	// Advance cursor
-	string new_event_id = !parsed.next_event_id.empty() ? parsed.next_event_id : current_event_id;
-	con.Query(
-	    "UPDATE inferal_relay.cursors "
-	    "SET last_event_id = $2, partition_hint = $3, "
-	    "    last_synced_at = current_timestamp, "
-	    "    pages_fetched = pages_fetched + 1, "
-	    "    members_received = members_received + $4 "
-	    "WHERE stream_name = $1",
-	    stream_name, new_event_id, parsed.next_partition_hint,
-	    result.members_received);
+		// Load current cursor to get fallback last_event_id.
+		auto cursor = con.Query(
+		    "SELECT last_event_id FROM inferal_relay.cursors WHERE stream_name = $1",
+		    stream_name);
+		auto &cursor_mat = Materialize(cursor);
+		if (cursor_mat.HasError() || cursor_mat.RowCount() == 0) {
+			throw InvalidInputException("Cursor for stream \"%s\" not found", stream_name);
+		}
+
+		string current_event_id;
+		if (!cursor_mat.GetValue(0, 0).IsNull()) {
+			current_event_id = cursor_mat.GetValue(0, 0).ToString();
+		}
+
+		// Upsert context and members within the same transaction/connection.
+		int64_t context_id = -1;
+		if (!parsed.context_json.empty()) {
+			context_id = UpsertContext(con, context, stream_name, parsed.context_json);
+		}
+		result.members_received = StoreMembers(con, context, stream_name, parsed.members, context_id);
+		result.next_event_id = parsed.next_event_id;
+		result.next_partition_hint = parsed.next_partition_hint;
+		result.has_more = parsed.has_more;
+		result.remaining_items = parsed.remaining_items;
+		result.sealed = parsed.sealed;
+		result.remaining_partitions = parsed.remaining_partitions;
+
+		// Advance cursor.
+		string new_event_id = !parsed.next_event_id.empty() ? parsed.next_event_id : current_event_id;
+		auto update_cursor = con.Query(
+		    "UPDATE inferal_relay.cursors "
+		    "SET last_event_id = $2, partition_hint = $3, "
+		    "    last_synced_at = current_timestamp, "
+		    "    pages_fetched = pages_fetched + 1, "
+		    "    members_received = members_received + $4 "
+		    "WHERE stream_name = $1 "
+		    "RETURNING stream_name",
+		    stream_name, new_event_id, parsed.next_partition_hint,
+		    result.members_received);
+		auto &update_mat = Materialize(update_cursor);
+		if (update_mat.HasError() || update_mat.RowCount() == 0) {
+			throw InvalidInputException("Failed to update cursor for stream \"%s\"", stream_name);
+		}
+
+		con.Query("COMMIT");
+	} catch (...) {
+		try {
+			con.Query("ROLLBACK");
+		} catch (...) {
+		}
+		throw;
+	}
 
 	return result;
 }
@@ -525,11 +552,8 @@ static void SyncScan(ClientContext &context, TableFunctionInput &data, DataChunk
 	string api_key = LookupApiKey(context, stream_name, full_url);
 
 	// Create sync log entry
-	con.Query(
-	    "INSERT INTO inferal_relay.sync_log(stream_name) VALUES ($1)",
-	    stream_name);
 	auto log_id_result = con.Query(
-	    "SELECT max(id) FROM inferal_relay.sync_log WHERE stream_name = $1",
+	    "INSERT INTO inferal_relay.sync_log(stream_name) VALUES ($1) RETURNING id",
 	    stream_name);
 	auto &log_id_mat = Materialize(log_id_result);
 	int64_t log_id = log_id_mat.GetValue(0, 0).GetValue<int64_t>();

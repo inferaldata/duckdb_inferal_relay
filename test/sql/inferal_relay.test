@@ -278,6 +278,45 @@ SELECT inferal_relay_resolve_term('test-stream', 'fileCount');
 https://relay.inferal.com/ontology#fileCount
 
 # ============================================================================
+# Strict ingest error handling (malformed payloads / unknown streams)
+# ============================================================================
+
+# Malformed JSON must error and not advance cursor counters
+statement error
+SELECT * FROM inferal_relay_ingest_page('test-stream', '{');
+----
+Invalid Input Error: Invalid inferal_relay page payload: malformed JSON
+
+query I
+SELECT pages_fetched FROM inferal_relay.cursors WHERE stream_name = 'test-stream';
+----
+3
+
+# Non-object JSON payload must error and not advance cursor counters
+statement error
+SELECT * FROM inferal_relay_ingest_page('test-stream', '[]');
+----
+Invalid Input Error: Invalid inferal_relay page payload: top-level JSON value must be an object
+
+query I
+SELECT pages_fetched FROM inferal_relay.cursors WHERE stream_name = 'test-stream';
+----
+3
+
+# Unknown stream must error and must not create orphan writes
+statement error
+SELECT * FROM inferal_relay_ingest_page('missing-stream', '{"tree:member":[{"relay:eventId":"x"}]}');
+----
+Invalid Input Error: Stream "missing-stream" not found
+
+query II
+SELECT
+  (SELECT count(*) FROM inferal_relay.members WHERE stream_name = 'missing-stream'),
+  (SELECT count(*) FROM inferal_relay.contexts WHERE stream_name = 'missing-stream');
+----
+0	0
+
+# ============================================================================
 # Reset cursor
 # ============================================================================
 

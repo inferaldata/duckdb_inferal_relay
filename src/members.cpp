@@ -19,16 +19,11 @@ static Value JsonValue(const string &json_str) {
 	return v;
 }
 
-int64_t StoreMembers(ClientContext &context, const string &stream_name,
+int64_t StoreMembers(Connection &con, ClientContext &context, const string &stream_name,
                      const vector<ParsedMember> &members, int64_t context_id) {
 	if (members.empty()) {
 		return 0;
 	}
-
-	EnsureSchema(context);
-
-	auto &db = DatabaseInstance::GetDatabase(context);
-	Connection con(db);
 
 	// Count existing members before insert
 	auto before = con.Query(
@@ -99,6 +94,17 @@ int64_t StoreMembers(ClientContext &context, const string &stream_name,
 	}
 
 	return count_after - count_before;
+}
+
+int64_t StoreMembers(ClientContext &context, const string &stream_name,
+                     const vector<ParsedMember> &members, int64_t context_id) {
+	if (members.empty()) {
+		return 0;
+	}
+	EnsureSchema(context);
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection con(db);
+	return StoreMembers(con, context, stream_name, members, context_id);
 }
 
 } // namespace inferal_relay

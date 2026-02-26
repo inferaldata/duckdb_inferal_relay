@@ -45,13 +45,13 @@ ParsedResponse ProcessResponse(const string &response_body) {
 
 	yyjson_doc *doc = yyjson_read(response_body.c_str(), response_body.size(), 0);
 	if (!doc) {
-		return result;
+		throw InvalidInputException("Invalid inferal_relay page payload: malformed JSON");
 	}
 
 	yyjson_val *root = yyjson_doc_get_root(doc);
 	if (!root || !yyjson_is_obj(root)) {
 		yyjson_doc_free(doc);
-		return result;
+		throw InvalidInputException("Invalid inferal_relay page payload: top-level JSON value must be an object");
 	}
 
 	// Extract @context
