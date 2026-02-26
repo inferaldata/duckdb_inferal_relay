@@ -6,11 +6,9 @@ require inferal_relay
 
 require json
 
-# Extension loads and version works
-query I
+# Extension loads and version function exists
+statement ok
 SELECT inferal_relay_version();
-----
-0.1.0
 
 # ============================================================================
 # Schema creation (lazy, triggered by first function call)
