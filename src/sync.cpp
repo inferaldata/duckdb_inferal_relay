@@ -871,6 +871,243 @@ static void LdesReadScan(ClientContext &context, TableFunctionInput &data, DataC
 }
 
 // ============================================================================
+// Table function: inferal_relay_live (sync + query in one call)
+// ============================================================================
+struct LiveBindData : public FunctionData {
+	string stream_name;
+	int32_t max_pages;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto copy = make_uniq<LiveBindData>();
+		copy->stream_name = stream_name;
+		copy->max_pages = max_pages;
+		return std::move(copy);
+	}
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<LiveBindData>();
+		return stream_name == other.stream_name && max_pages == other.max_pages;
+	}
+};
+
+struct LiveGlobalState : public GlobalTableFunctionState {
+	bool done = false;
+	unique_ptr<QueryResult> query_result;
+	idx_t row_offset = 0;
+	idx_t total_rows = 0;
+	string sync_error;
+
+	// Progress tracking
+	std::atomic<int64_t> items_fetched{0};
+	std::atomic<int64_t> estimated_total_items{0};
+	std::atomic<int32_t> pages_fetched{0};
+};
+
+static unique_ptr<FunctionData> LiveBind(ClientContext &context, TableFunctionBindInput &input,
+                                          vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind_data = make_uniq<LiveBindData>();
+	bind_data->stream_name = input.inputs[0].ToString();
+	bind_data->max_pages = input.inputs.size() > 1 ? input.inputs[1].GetValue<int32_t>() : 100;
+
+	names.push_back("event_id");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("member_id");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("generated_at");
+	return_types.push_back(LogicalType::TIMESTAMP);
+	names.push_back("member_path");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("data");
+	return_types.push_back(LogicalType::JSON());
+
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> LiveInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
+	return make_uniq<LiveGlobalState>();
+}
+
+static double LiveProgress(ClientContext &context, const FunctionData *bind_data_p,
+                            const GlobalTableFunctionState *global_state_p) {
+	auto &bind_data = bind_data_p->Cast<LiveBindData>();
+	auto &gstate = global_state_p->Cast<LiveGlobalState>();
+
+	auto total = gstate.estimated_total_items.load();
+	if (total > 0) {
+		auto fetched = gstate.items_fetched.load();
+		return MinValue<double>(100.0 * static_cast<double>(fetched) / static_cast<double>(total), 100.0);
+	}
+
+	if (bind_data.max_pages > 0) {
+		auto pages = gstate.pages_fetched.load();
+		return MinValue<double>(100.0 * static_cast<double>(pages) / static_cast<double>(bind_data.max_pages), 100.0);
+	}
+
+	return 0.0;
+}
+
+static void LiveScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<LiveBindData>();
+	auto &gstate = data.global_state->Cast<LiveGlobalState>();
+
+	// Subsequent calls: emit rows from materialized query result
+	if (gstate.done) {
+		if (!gstate.query_result || gstate.row_offset >= gstate.total_rows) {
+			return;
+		}
+		auto &mat = Materialize(gstate.query_result);
+		idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, gstate.total_rows - gstate.row_offset);
+		output.SetCardinality(count);
+		for (idx_t i = 0; i < count; i++) {
+			for (idx_t col = 0; col < 5; col++) {
+				output.SetValue(col, i, mat.GetValue(col, gstate.row_offset + i));
+			}
+		}
+		gstate.row_offset += count;
+		return;
+	}
+	gstate.done = true;
+
+	EnsureSchema(context);
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection con(db);
+
+	string stream_name = bind_data.stream_name;
+	int32_t max_pages = bind_data.max_pages;
+
+	// ---- Validate stream exists and is enabled (throw on config errors) ----
+	auto stream_result = con.Query(
+	    "SELECT base_url, stream_id, facet, page_limit, enabled "
+	    "FROM inferal_relay.streams WHERE name = $1", stream_name);
+	auto &stream_mat = Materialize(stream_result);
+
+	if (stream_mat.HasError() || stream_mat.RowCount() == 0) {
+		throw InvalidInputException("Stream \"%s\" not found", stream_name);
+	}
+
+	bool enabled = stream_mat.GetValue(4, 0).GetValue<bool>();
+	if (!enabled) {
+		throw InvalidInputException("Stream \"%s\" is disabled", stream_name);
+	}
+
+	auto base_url = stream_mat.GetValue(0, 0).ToString();
+	auto stream_id = stream_mat.GetValue(1, 0).ToString();
+	auto facet = stream_mat.GetValue(2, 0).ToString();
+	auto page_limit = stream_mat.GetValue(3, 0).GetValue<int32_t>();
+
+	// ---- Sync phase: fetch new pages (errors are non-fatal) ----
+	try {
+		auto cursor_result = con.Query(
+		    "SELECT last_event_id, partition_hint "
+		    "FROM inferal_relay.cursors WHERE stream_name = $1", stream_name);
+		auto &cursor_mat = Materialize(cursor_result);
+
+		string last_event_id, partition_hint;
+		if (!cursor_mat.HasError() && cursor_mat.RowCount() > 0) {
+			if (!cursor_mat.GetValue(0, 0).IsNull()) {
+				last_event_id = cursor_mat.GetValue(0, 0).ToString();
+			}
+			if (!cursor_mat.GetValue(1, 0).IsNull()) {
+				partition_hint = cursor_mat.GetValue(1, 0).ToString();
+			}
+		}
+
+		string full_url = BuildNextUrlDirect(base_url, stream_id, facet, page_limit);
+		string api_key = LookupApiKey(context, stream_name, full_url);
+
+		auto log_id_result = con.Query(
+		    "INSERT INTO inferal_relay.sync_log(stream_name) VALUES ($1) RETURNING id",
+		    stream_name);
+		auto &log_id_mat = Materialize(log_id_result);
+		int64_t log_id = log_id_mat.GetValue(0, 0).GetValue<int64_t>();
+
+		int32_t total_pages = 0;
+		int32_t total_members = 0;
+		bool has_more = true;
+		string error_msg;
+
+		try {
+			while (has_more && total_pages < max_pages) {
+				auto url = BuildNextUrlDirect(base_url, stream_id, facet, page_limit,
+				                               last_event_id, partition_hint);
+				auto response = HttpGet(url, api_key);
+
+				if (response.status_code != 200) {
+					if (response.status_code == 0) {
+						throw InvalidInputException("HTTP request failed: %s", response.error);
+					}
+					throw InvalidInputException("HTTP %d from %s", response.status_code, url);
+				}
+
+				auto ingest = IngestPageInternal(context, stream_name, response.body);
+
+				total_pages++;
+				total_members += ingest.members_received;
+
+				if (!ingest.next_event_id.empty()) {
+					last_event_id = ingest.next_event_id;
+					partition_hint = ingest.next_partition_hint;
+				}
+
+				has_more = ingest.has_more;
+
+				// Update progress atomics
+				if (ingest.remaining_items >= 0) {
+					int64_t extra_items = 0;
+					if (ingest.sealed && ingest.remaining_partitions > 0 && ingest.remaining_items > 0) {
+						extra_items = ingest.remaining_partitions * ingest.remaining_items;
+					}
+					int64_t total_items = total_members + ingest.remaining_items + extra_items;
+					gstate.estimated_total_items.store(total_items);
+					gstate.items_fetched.store(total_members);
+				}
+				gstate.pages_fetched.store(total_pages);
+			}
+
+			con.Query(
+			    "UPDATE inferal_relay.sync_log "
+			    "SET finished_at = current_timestamp, pages_fetched = $2, "
+			    "    members_received = $3, last_event_id = $4, status = 'completed' "
+			    "WHERE id = $1",
+			    log_id, total_pages, total_members, last_event_id);
+
+		} catch (std::exception &e) {
+			gstate.sync_error = e.what();
+			con.Query(
+			    "UPDATE inferal_relay.sync_log "
+			    "SET finished_at = current_timestamp, pages_fetched = $2, "
+			    "    members_received = $3, last_event_id = $4, status = 'error', "
+			    "    error_message = $5 "
+			    "WHERE id = $1",
+			    log_id, total_pages, total_members, last_event_id, gstate.sync_error);
+		}
+	} catch (std::exception &e) {
+		// Cursor/log setup failed -- still proceed to query phase
+		gstate.sync_error = e.what();
+	}
+
+	// ---- Query phase: return all members ----
+	gstate.query_result = con.Query(
+	    "SELECT event_id, member_id, generated_at, member_path, data "
+	    "FROM inferal_relay.members WHERE stream_name = $1 ORDER BY event_id",
+	    stream_name);
+	auto &mat = Materialize(gstate.query_result);
+
+	if (mat.HasError() || mat.RowCount() == 0) {
+		return;
+	}
+
+	gstate.total_rows = mat.RowCount();
+	idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, gstate.total_rows);
+	output.SetCardinality(count);
+	for (idx_t i = 0; i < count; i++) {
+		for (idx_t col = 0; col < 5; col++) {
+			output.SetValue(col, i, mat.GetValue(col, i));
+		}
+	}
+	gstate.row_offset = count;
+}
+
+// ============================================================================
 // Registration
 // ============================================================================
 void RegisterFunctions(ExtensionLoader &loader) {
@@ -944,6 +1181,18 @@ void RegisterFunctions(ExtensionLoader &loader) {
 	inferal_relay_stream.named_parameters["max_pages"] = LogicalType::INTEGER;
 	inferal_relay_stream.named_parameters["since"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(inferal_relay_stream);
+
+	TableFunction live_fn("inferal_relay_live",
+	                        {LogicalType::VARCHAR, LogicalType::INTEGER},
+	                        LiveScan, LiveBind, LiveInitGlobal);
+	live_fn.table_scan_progress = LiveProgress;
+	loader.RegisterFunction(live_fn);
+
+	TableFunction live_fn_1("inferal_relay_live",
+	                          {LogicalType::VARCHAR},
+	                          LiveScan, LiveBind, LiveInitGlobal);
+	live_fn_1.table_scan_progress = LiveProgress;
+	loader.RegisterFunction(live_fn_1);
 }
 
 } // namespace inferal_relay

@@ -357,6 +357,104 @@ SELECT inferal_relay_add_stream('bad-limit-high', 'https://example.com', 'acme',
 Invalid Input Error: page_limit must be between 1 and 10000
 
 # ============================================================================
+# inferal_relay_live table function
+# ============================================================================
+
+# Use a dedicated stream to isolate from earlier test state
+statement ok
+SELECT inferal_relay_add_stream('live-test', 'https://relay.inferal.com', 'live-org', 'snapshots', 100);
+
+# Empty stream returns 0 rows (sync fails against fake URL, no error thrown)
+query I
+SELECT count(*) FROM inferal_relay_live('live-test');
+----
+0
+
+# After ingesting pages, live returns correct members
+statement ok
+SELECT * FROM inferal_relay_ingest_page('live-test', '{
+    "tree:member": [
+        {
+            "@id": "urn:entity:live-1",
+            "relay:eventId": "018f0002-0000-7000-8000-000000000001",
+            "prov:generatedAtTime": {"@value": "2026-02-01T10:00:00Z", "@type": "xsd:dateTime"},
+            "relay:path": "region-a",
+            "name": "Live One"
+        },
+        {
+            "@id": "urn:entity:live-2",
+            "relay:eventId": "018f0002-0000-7000-8000-000000000002",
+            "prov:generatedAtTime": {"@value": "2026-02-01T10:01:00Z", "@type": "xsd:dateTime"},
+            "relay:path": "region-b",
+            "name": "Live Two"
+        }
+    ]
+}');
+
+query I
+SELECT count(*) FROM inferal_relay_live('live-test');
+----
+2
+
+# Verify column names and types
+query IIIII
+SELECT event_id, member_id, generated_at, member_path, typeof(data)
+FROM inferal_relay_live('live-test')
+WHERE event_id = '018f0002-0000-7000-8000-000000000001';
+----
+018f0002-0000-7000-8000-000000000001	urn:entity:live-1	2026-02-01 10:00:00	region-a	JSON
+
+# generated_at is TIMESTAMP type
+query I
+SELECT typeof(generated_at)
+FROM inferal_relay_live('live-test')
+LIMIT 1;
+----
+TIMESTAMP
+
+# Results ordered by event_id
+query I
+SELECT event_id FROM inferal_relay_live('live-test');
+----
+018f0002-0000-7000-8000-000000000001
+018f0002-0000-7000-8000-000000000002
+
+# max_pages parameter works (2-arg form)
+query I
+SELECT count(*) FROM inferal_relay_live('live-test', 5);
+----
+2
+
+# Incremental: ingest more, live returns updated count
+statement ok
+SELECT * FROM inferal_relay_ingest_page('live-test', '{
+    "tree:member": [
+        {
+            "@id": "urn:entity:live-3",
+            "relay:eventId": "018f0002-0000-7000-8000-000000000003",
+            "prov:generatedAtTime": {"@value": "2026-02-01T10:02:00Z", "@type": "xsd:dateTime"},
+            "relay:path": "region-c",
+            "name": "Live Three"
+        }
+    ]
+}');
+
+query I
+SELECT count(*) FROM inferal_relay_live('live-test');
+----
+3
+
+# Stream-not-found throws error
+statement error
+SELECT * FROM inferal_relay_live('nonexistent-stream');
+----
+Invalid Input Error: Stream "nonexistent-stream" not found
+
+# Clean up live-test stream
+statement ok
+SELECT inferal_relay_remove_stream('live-test');
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 

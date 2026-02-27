@@ -38,6 +38,10 @@ FROM inferal_relay.members
 WHERE stream_name = 'my-stream'
 ORDER BY generated_at DESC
 LIMIT 10;
+
+-- Or sync + query in one call (auto-refreshing table)
+SELECT * FROM inferal_relay_live('my-stream');
+COPY (SELECT * FROM inferal_relay_live('my-stream')) TO 'data.parquet';
 ```
 
 ## External sync (no outbound HTTP)
@@ -86,6 +90,25 @@ SELECT * FROM inferal_relay_stream(
 CREATE TABLE my_data AS
 SELECT * FROM inferal_relay_stream('https://relay.inferal.com/streams/acme/snapshots?limit=100');
 ```
+
+## Live table function
+
+Combines sync and query into a single call. Fetches new pages from the remote, then returns all stored members:
+
+```sql
+-- Sync + query in one call
+SELECT * FROM inferal_relay_live('my-stream');
+
+-- With explicit page limit
+SELECT * FROM inferal_relay_live('my-stream', 50);
+
+-- Export to Parquet
+COPY (SELECT * FROM inferal_relay_live('my-stream')) TO 'data.parquet';
+```
+
+Returns columns: `event_id VARCHAR, member_id VARCHAR, generated_at TIMESTAMP, member_path VARCHAR, data JSON`.
+
+If sync fails due to a transient HTTP error, the function still returns existing members from the database rather than throwing an error. Stream-not-found and disabled-stream errors throw immediately since they indicate configuration problems.
 
 ## Credentials
 
@@ -154,6 +177,7 @@ SELECT inferal_relay_resolve_term('my-stream', 'name');
 | `inferal_relay_sync(stream [, max_pages])` | Full sync loop with HTTP |
 | `inferal_relay_ingest_page(stream, body)` | Ingest a pre-fetched page |
 | `inferal_relay_status(stream)` | Stream + cursor status |
+| `inferal_relay_live(stream [, max_pages])` | Sync + query: fetches new pages, returns all members |
 | `inferal_relay_stream(url [, api_key, max_pages, since])` | Stateless LDES reader (follows pagination, resolves secrets by URL) |
 
 ## Tables
