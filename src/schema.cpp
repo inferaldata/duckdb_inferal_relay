@@ -1,19 +1,25 @@
 #include "schema.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
 
 namespace duckdb {
 namespace inferal_relay {
 
-static bool g_schema_initialized = false;
-
 void EnsureSchema(ClientContext &context) {
-	if (g_schema_initialized) {
-		return;
-	}
-
 	// Use a connection from the same database
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection con(db);
+
+	// Quick check: if the schema and a key table already exist, skip DDL
+	auto probe = con.Query(
+	    "SELECT 1 FROM information_schema.tables "
+	    "WHERE table_schema = 'inferal_relay' AND table_name = 'streams' LIMIT 1");
+	if (probe && !probe->HasError()) {
+		auto &mat = probe->Cast<MaterializedQueryResult>();
+		if (mat.RowCount() > 0) {
+			return;
+		}
+	}
 
 	// Create schema
 	con.Query("CREATE SCHEMA IF NOT EXISTS inferal_relay");
@@ -105,11 +111,7 @@ void EnsureSchema(ClientContext &context) {
 		)
 	)");
 
-	g_schema_initialized = true;
 }
-
-// Reset the schema init flag (for testing or when DB is reopened)
-// This is called implicitly — the global bool resets on extension reload.
 
 } // namespace inferal_relay
 } // namespace duckdb

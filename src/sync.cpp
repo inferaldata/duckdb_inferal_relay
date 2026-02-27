@@ -2,6 +2,7 @@
 #include "schema.hpp"
 #include "secrets.hpp"
 #include "http.hpp"
+#include "mock_http.hpp"
 #include "url_builder.hpp"
 #include "parser.hpp"
 #include "context.hpp"
@@ -37,85 +38,87 @@ struct IngestResult {
 	int32_t remaining_partitions = 0;
 };
 
-static IngestResult IngestPageInternal(ClientContext &context, const string &stream_name,
-                                       const string &response_body) {
-	EnsureSchema(context);
-
+// Ingest a page within an existing transaction (no BEGIN/COMMIT - caller manages transaction).
+static IngestResult IngestPageInTransaction(Connection &con, ClientContext &context, const string &stream_name,
+                                            const string &response_body) {
 	IngestResult result;
 	result.members_received = 0;
 	result.has_more = false;
 
-	// Parse response first: invalid payloads must fail before any writes.
 	auto parsed = ProcessResponse(response_body);
 
+	// Validate stream and cursor existence before any writes.
+	auto stream = con.Query(
+	    "SELECT 1 FROM inferal_relay.streams WHERE name = $1",
+	    stream_name);
+	auto &stream_mat = Materialize(stream);
+	if (stream_mat.HasError() || stream_mat.RowCount() == 0) {
+		throw InvalidInputException("Stream \"%s\" not found", stream_name);
+	}
+
+	// Load current cursor to get fallback last_event_id.
+	auto cursor = con.Query(
+	    "SELECT last_event_id FROM inferal_relay.cursors WHERE stream_name = $1",
+	    stream_name);
+	auto &cursor_mat = Materialize(cursor);
+	if (cursor_mat.HasError() || cursor_mat.RowCount() == 0) {
+		throw InvalidInputException("Cursor for stream \"%s\" not found", stream_name);
+	}
+
+	string current_event_id;
+	if (!cursor_mat.GetValue(0, 0).IsNull()) {
+		current_event_id = cursor_mat.GetValue(0, 0).ToString();
+	}
+
+	// Upsert context and members within the caller's transaction.
+	int64_t context_id = -1;
+	if (!parsed.context_json.empty()) {
+		context_id = UpsertContext(con, context, stream_name, parsed.context_json);
+	}
+	result.members_received = StoreMembers(con, context, stream_name, parsed.members, context_id);
+	result.next_event_id = parsed.next_event_id;
+	result.next_partition_hint = parsed.next_partition_hint;
+	result.has_more = parsed.has_more;
+	result.remaining_items = parsed.remaining_items;
+	result.sealed = parsed.sealed;
+	result.remaining_partitions = parsed.remaining_partitions;
+
+	// Advance cursor.
+	string new_event_id = !parsed.next_event_id.empty() ? parsed.next_event_id : current_event_id;
+	auto update_cursor = con.Query(
+	    "UPDATE inferal_relay.cursors "
+	    "SET last_event_id = $2, partition_hint = $3, "
+	    "    last_synced_at = current_timestamp, "
+	    "    pages_fetched = pages_fetched + 1, "
+	    "    members_received = members_received + $4 "
+	    "WHERE stream_name = $1 "
+	    "RETURNING stream_name",
+	    stream_name, new_event_id, parsed.next_partition_hint,
+	    result.members_received);
+	auto &update_mat = Materialize(update_cursor);
+	if (update_mat.HasError() || update_mat.RowCount() == 0) {
+		throw InvalidInputException("Failed to update cursor for stream \"%s\"", stream_name);
+	}
+
+	return result;
+}
+
+// Standalone version: creates its own Connection and wraps in a transaction.
+static IngestResult IngestPageInternal(ClientContext &context, const string &stream_name,
+                                       const string &response_body) {
+	EnsureSchema(context);
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection con(db);
 
 	con.Query("BEGIN TRANSACTION");
 	try {
-		// Validate stream and cursor existence before any writes.
-		auto stream = con.Query(
-		    "SELECT 1 FROM inferal_relay.streams WHERE name = $1",
-		    stream_name);
-		auto &stream_mat = Materialize(stream);
-		if (stream_mat.HasError() || stream_mat.RowCount() == 0) {
-			throw InvalidInputException("Stream \"%s\" not found", stream_name);
-		}
-
-		// Load current cursor to get fallback last_event_id.
-		auto cursor = con.Query(
-		    "SELECT last_event_id FROM inferal_relay.cursors WHERE stream_name = $1",
-		    stream_name);
-		auto &cursor_mat = Materialize(cursor);
-		if (cursor_mat.HasError() || cursor_mat.RowCount() == 0) {
-			throw InvalidInputException("Cursor for stream \"%s\" not found", stream_name);
-		}
-
-		string current_event_id;
-		if (!cursor_mat.GetValue(0, 0).IsNull()) {
-			current_event_id = cursor_mat.GetValue(0, 0).ToString();
-		}
-
-		// Upsert context and members within the same transaction/connection.
-		int64_t context_id = -1;
-		if (!parsed.context_json.empty()) {
-			context_id = UpsertContext(con, context, stream_name, parsed.context_json);
-		}
-		result.members_received = StoreMembers(con, context, stream_name, parsed.members, context_id);
-		result.next_event_id = parsed.next_event_id;
-		result.next_partition_hint = parsed.next_partition_hint;
-		result.has_more = parsed.has_more;
-		result.remaining_items = parsed.remaining_items;
-		result.sealed = parsed.sealed;
-		result.remaining_partitions = parsed.remaining_partitions;
-
-		// Advance cursor.
-		string new_event_id = !parsed.next_event_id.empty() ? parsed.next_event_id : current_event_id;
-		auto update_cursor = con.Query(
-		    "UPDATE inferal_relay.cursors "
-		    "SET last_event_id = $2, partition_hint = $3, "
-		    "    last_synced_at = current_timestamp, "
-		    "    pages_fetched = pages_fetched + 1, "
-		    "    members_received = members_received + $4 "
-		    "WHERE stream_name = $1 "
-		    "RETURNING stream_name",
-		    stream_name, new_event_id, parsed.next_partition_hint,
-		    result.members_received);
-		auto &update_mat = Materialize(update_cursor);
-		if (update_mat.HasError() || update_mat.RowCount() == 0) {
-			throw InvalidInputException("Failed to update cursor for stream \"%s\"", stream_name);
-		}
-
+		auto result = IngestPageInTransaction(con, context, stream_name, response_body);
 		con.Query("COMMIT");
+		return result;
 	} catch (...) {
-		try {
-			con.Query("ROLLBACK");
-		} catch (...) {
-		}
+		try { con.Query("ROLLBACK"); } catch (...) {}
 		throw;
 	}
-
-	return result;
 }
 
 // ============================================================================
@@ -551,19 +554,20 @@ static void SyncScan(ClientContext &context, TableFunctionInput &data, DataChunk
 	string full_url = BuildNextUrlDirect(base_url, stream_id, facet, page_limit);
 	string api_key = LookupApiKey(context, stream_name, full_url);
 
-	// Create sync log entry
-	auto log_id_result = con.Query(
-	    "INSERT INTO inferal_relay.sync_log(stream_name) VALUES ($1) RETURNING id",
-	    stream_name);
-	auto &log_id_mat = Materialize(log_id_result);
-	int64_t log_id = log_id_mat.GetValue(0, 0).GetValue<int64_t>();
-
 	int32_t total_pages = 0;
 	int32_t total_members = 0;
 	bool has_more = true;
 	string error_msg;
 
+	con.Query("BEGIN TRANSACTION");
 	try {
+		// Create sync log entry inside the transaction
+		auto log_id_result = con.Query(
+		    "INSERT INTO inferal_relay.sync_log(stream_name) VALUES ($1) RETURNING id",
+		    stream_name);
+		auto &log_id_mat = Materialize(log_id_result);
+		int64_t log_id = log_id_mat.GetValue(0, 0).GetValue<int64_t>();
+
 		while (has_more && total_pages < max_pages) {
 			auto url = BuildNextUrlDirect(base_url, stream_id, facet, page_limit,
 			                               last_event_id, partition_hint);
@@ -576,7 +580,7 @@ static void SyncScan(ClientContext &context, TableFunctionInput &data, DataChunk
 				throw InvalidInputException("HTTP %d from %s", response.status_code, url);
 			}
 
-			auto ingest = IngestPageInternal(context, stream_name, response.body);
+			auto ingest = IngestPageInTransaction(con, context, stream_name, response.body);
 
 			total_pages++;
 			total_members += ingest.members_received;
@@ -619,16 +623,19 @@ static void SyncScan(ClientContext &context, TableFunctionInput &data, DataChunk
 		    "WHERE id = $1",
 		    log_id, total_pages, total_members, last_event_id);
 
+		con.Query("COMMIT");
+
 	} catch (std::exception &e) {
+		try { con.Query("ROLLBACK"); } catch (...) {}
+
 		error_msg = e.what();
 		gstate.rows.push_back({total_pages, 0, last_event_id, false, "error", error_msg});
+		// Log the error in a separate auto-commit
 		con.Query(
-		    "UPDATE inferal_relay.sync_log "
-		    "SET finished_at = current_timestamp, pages_fetched = $2, "
-		    "    members_received = $3, last_event_id = $4, status = 'error', "
-		    "    error_message = $5 "
-		    "WHERE id = $1",
-		    log_id, total_pages, total_members, last_event_id, error_msg);
+		    "INSERT INTO inferal_relay.sync_log(stream_name, finished_at, pages_fetched, "
+		    "    members_received, last_event_id, status, error_message) "
+		    "VALUES ($1, current_timestamp, $2, $3, $4, 'error', $5)",
+		    stream_name, total_pages, total_members, last_event_id, error_msg);
 	}
 
 	// Emit first batch of accumulated rows
@@ -1014,18 +1021,18 @@ static void LiveScan(ClientContext &context, TableFunctionInput &data, DataChunk
 		string full_url = BuildNextUrlDirect(base_url, stream_id, facet, page_limit);
 		string api_key = LookupApiKey(context, stream_name, full_url);
 
-		auto log_id_result = con.Query(
-		    "INSERT INTO inferal_relay.sync_log(stream_name) VALUES ($1) RETURNING id",
-		    stream_name);
-		auto &log_id_mat = Materialize(log_id_result);
-		int64_t log_id = log_id_mat.GetValue(0, 0).GetValue<int64_t>();
-
 		int32_t total_pages = 0;
 		int32_t total_members = 0;
 		bool has_more = true;
-		string error_msg;
 
+		con.Query("BEGIN TRANSACTION");
 		try {
+			auto log_id_result = con.Query(
+			    "INSERT INTO inferal_relay.sync_log(stream_name) VALUES ($1) RETURNING id",
+			    stream_name);
+			auto &log_id_mat = Materialize(log_id_result);
+			int64_t log_id = log_id_mat.GetValue(0, 0).GetValue<int64_t>();
+
 			while (has_more && total_pages < max_pages) {
 				auto url = BuildNextUrlDirect(base_url, stream_id, facet, page_limit,
 				                               last_event_id, partition_hint);
@@ -1038,7 +1045,7 @@ static void LiveScan(ClientContext &context, TableFunctionInput &data, DataChunk
 					throw InvalidInputException("HTTP %d from %s", response.status_code, url);
 				}
 
-				auto ingest = IngestPageInternal(context, stream_name, response.body);
+				auto ingest = IngestPageInTransaction(con, context, stream_name, response.body);
 
 				total_pages++;
 				total_members += ingest.members_received;
@@ -1070,15 +1077,17 @@ static void LiveScan(ClientContext &context, TableFunctionInput &data, DataChunk
 			    "WHERE id = $1",
 			    log_id, total_pages, total_members, last_event_id);
 
+			con.Query("COMMIT");
+
 		} catch (std::exception &e) {
+			try { con.Query("ROLLBACK"); } catch (...) {}
+
 			gstate.sync_error = e.what();
 			con.Query(
-			    "UPDATE inferal_relay.sync_log "
-			    "SET finished_at = current_timestamp, pages_fetched = $2, "
-			    "    members_received = $3, last_event_id = $4, status = 'error', "
-			    "    error_message = $5 "
-			    "WHERE id = $1",
-			    log_id, total_pages, total_members, last_event_id, gstate.sync_error);
+			    "INSERT INTO inferal_relay.sync_log(stream_name, finished_at, pages_fetched, "
+			    "    members_received, last_event_id, status, error_message) "
+			    "VALUES ($1, current_timestamp, $2, $3, $4, 'error', $5)",
+			    stream_name, total_pages, total_members, last_event_id, gstate.sync_error);
 		}
 	} catch (std::exception &e) {
 		// Cursor/log setup failed -- still proceed to query phase
@@ -1105,6 +1114,20 @@ static void LiveScan(ClientContext &context, TableFunctionInput &data, DataChunk
 		}
 	}
 	gstate.row_offset = count;
+}
+
+// ============================================================================
+// Mock adapter SQL functions
+// ============================================================================
+static void InstallMockAdapterFn(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	InstallMockAdapter(context);
+	result.SetValue(0, Value("Mock HTTP adapter installed"));
+}
+
+static void ResetMockAdapterFn(DataChunk &args, ExpressionState &state, Vector &result) {
+	ResetMockAdapter();
+	result.SetValue(0, Value("Mock HTTP adapter reset"));
 }
 
 // ============================================================================
@@ -1149,6 +1172,18 @@ void RegisterFunctions(ExtensionLoader &loader) {
 	    {},
 	    LogicalType::VARCHAR, VersionFn);
 	loader.RegisterFunction(version);
+
+	auto install_mock = ScalarFunction(
+	    "inferal_relay_install_mock_adapter",
+	    {},
+	    LogicalType::VARCHAR, InstallMockAdapterFn);
+	loader.RegisterFunction(install_mock);
+
+	auto reset_mock = ScalarFunction(
+	    "inferal_relay_reset_mock_adapter",
+	    {},
+	    LogicalType::VARCHAR, ResetMockAdapterFn);
+	loader.RegisterFunction(reset_mock);
 
 	// Table functions
 	TableFunction ingest_page("inferal_relay_ingest_page",

@@ -1,0 +1,196 @@
+# name: test/sql/mock_sync.test
+# description: Test mock HTTP adapter for end-to-end sync
+# group: [inferal_relay]
+
+require inferal_relay
+
+require json
+
+# ============================================================================
+# Setup: install mock adapter and add a stream
+# ============================================================================
+
+statement ok
+SELECT inferal_relay_install_mock_adapter();
+
+statement ok
+SELECT inferal_relay_add_stream('mock-stream', 'https://relay.example.com', 'test-org', 'snapshots', 100);
+
+# ============================================================================
+# Test 1: Single-page sync (no tree:relation → one page, completed)
+# ============================================================================
+
+# Mock response for the initial page URL (no since param)
+statement ok
+INSERT INTO inferal_relay.mock_responses (url_pattern, body) VALUES ('.*snapshots\?limit=.*', '{
+    "tree:member": [
+        {
+            "@id": "urn:entity:1",
+            "relay:eventId": "018f0001-0000-7000-8000-000000000001",
+            "prov:generatedAtTime": {"@value": "2026-01-27T12:00:00Z", "@type": "xsd:dateTime"},
+            "relay:path": "us-east/prod",
+            "name": "Entity One"
+        },
+        {
+            "@id": "urn:entity:2",
+            "relay:eventId": "018f0001-0000-7000-8000-000000000002",
+            "prov:generatedAtTime": {"@value": "2026-01-27T12:01:00Z", "@type": "xsd:dateTime"},
+            "relay:path": "us-east/prod",
+            "name": "Entity Two"
+        }
+    ]
+}');
+
+query IIIIIII
+SELECT stream, pages_fetched, members_received, last_event_id, has_more, status, error
+FROM inferal_relay_sync('mock-stream');
+----
+mock-stream	1	2	NULL	false	completed	NULL
+
+# Verify members table has 2 rows
+query I
+SELECT count(*) FROM inferal_relay.members WHERE stream_name = 'mock-stream';
+----
+2
+
+# ============================================================================
+# Test 2: Multi-page sync (page 1 has tree:relation, page 2 doesn't)
+# ============================================================================
+
+# Reset cursor to re-sync from scratch
+statement ok
+SELECT inferal_relay_reset_cursor('mock-stream');
+
+# Clear existing members and mock responses for clean test
+statement ok
+DELETE FROM inferal_relay.members WHERE stream_name = 'mock-stream';
+
+statement ok
+DELETE FROM inferal_relay.mock_responses;
+
+# Page 1: matches initial URL (no "since" param), has tree:relation
+statement ok
+INSERT INTO inferal_relay.mock_responses (url_pattern, body) VALUES ('.*snapshots\?limit=.*', '{
+    "tree:member": [
+        {
+            "@id": "urn:entity:10",
+            "relay:eventId": "018f0010-0000-7000-8000-000000000001",
+            "prov:generatedAtTime": "2026-02-01T10:00:00Z",
+            "relay:path": "region-a",
+            "name": "Page1 Member1"
+        },
+        {
+            "@id": "urn:entity:11",
+            "relay:eventId": "018f0010-0000-7000-8000-000000000002",
+            "prov:generatedAtTime": "2026-02-01T10:01:00Z",
+            "relay:path": "region-a",
+            "name": "Page1 Member2"
+        }
+    ],
+    "tree:relation": [{
+        "@type": "tree:GreaterThanRelation",
+        "tree:node": "/streams/test-org/snapshots?since=018f0010-0000-7000-8000-000000000002",
+        "tree:path": {"@id": "relay:eventId"},
+        "tree:value": {"@value": "018f0010-0000-7000-8000-000000000002", "@type": "xsd:string"}
+    }]
+}');
+
+# Page 2: matches URL with "since" param, no tree:relation (last page)
+statement ok
+INSERT INTO inferal_relay.mock_responses (url_pattern, body) VALUES ('.*since=018f0010.*', '{
+    "tree:member": [
+        {
+            "@id": "urn:entity:12",
+            "relay:eventId": "018f0010-0000-7000-8000-000000000003",
+            "prov:generatedAtTime": "2026-02-01T10:02:00Z",
+            "relay:path": "region-b",
+            "name": "Page2 Member1"
+        }
+    ]
+}');
+
+# Sync should produce 2 rows (one per page)
+query IIII
+SELECT pages_fetched, members_received, has_more, status
+FROM inferal_relay_sync('mock-stream');
+----
+1	2	true	syncing
+2	1	false	completed
+
+# Members table has all 3 members
+query I
+SELECT count(*) FROM inferal_relay.members WHERE stream_name = 'mock-stream';
+----
+3
+
+# ============================================================================
+# Test 3: HTTP error (500 from server)
+# ============================================================================
+
+statement ok
+SELECT inferal_relay_reset_cursor('mock-stream');
+
+statement ok
+DELETE FROM inferal_relay.mock_responses;
+
+statement ok
+INSERT INTO inferal_relay.mock_responses (url_pattern, status_code, body) VALUES ('.*', 500, 'Internal Server Error');
+
+query II
+SELECT status, error IS NOT NULL as has_error
+FROM inferal_relay_sync('mock-stream');
+----
+error	true
+
+# ============================================================================
+# Test 4: No mock response available (404 from mock adapter)
+# ============================================================================
+
+statement ok
+SELECT inferal_relay_reset_cursor('mock-stream');
+
+statement ok
+DELETE FROM inferal_relay.mock_responses;
+
+# No responses inserted — mock returns 404
+query II
+SELECT status, error IS NOT NULL as has_error
+FROM inferal_relay_sync('mock-stream');
+----
+error	true
+
+# ============================================================================
+# Test 5: URL pattern matching (specific pattern)
+# ============================================================================
+
+statement ok
+SELECT inferal_relay_reset_cursor('mock-stream');
+
+# Insert response matching only URLs containing 'test-org'
+statement ok
+INSERT INTO inferal_relay.mock_responses (url_pattern, body) VALUES ('.*test-org.*', '{
+    "tree:member": [
+        {
+            "@id": "urn:entity:pattern-match",
+            "relay:eventId": "018f0099-0000-7000-8000-000000000001",
+            "prov:generatedAtTime": "2026-03-01T10:00:00Z",
+            "name": "Pattern Matched"
+        }
+    ]
+}');
+
+query III
+SELECT pages_fetched, members_received, status
+FROM inferal_relay_sync('mock-stream');
+----
+1	1	completed
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+SELECT inferal_relay_reset_mock_adapter();
+
+statement ok
+SELECT inferal_relay_remove_stream('mock-stream');

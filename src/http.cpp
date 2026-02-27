@@ -4,6 +4,7 @@
 #include "httplib.hpp"
 
 #include <chrono>
+#include <mutex>
 #include <random>
 #include <thread>
 
@@ -16,6 +17,19 @@ namespace httplib = duckdb_httplib;
 
 namespace duckdb {
 namespace inferal_relay {
+
+static std::mutex g_http_getter_mutex;
+static HttpGetFn g_custom_http_getter;
+
+void SetHttpGetter(HttpGetFn fn) {
+	std::lock_guard<std::mutex> lock(g_http_getter_mutex);
+	g_custom_http_getter = std::move(fn);
+}
+
+void ResetHttpGetter() {
+	std::lock_guard<std::mutex> lock(g_http_getter_mutex);
+	g_custom_http_getter = nullptr;
+}
 
 static bool IsRetryable(int status_code) {
 	if (status_code == 0) {
@@ -73,6 +87,13 @@ static int ParseRetryAfterMs(const httplib::Result &res) {
 }
 
 HttpResponse HttpGet(const string &url, const string &api_key, const RetryConfig &retry_config) {
+	{
+		std::lock_guard<std::mutex> lock(g_http_getter_mutex);
+		if (g_custom_http_getter) {
+			return g_custom_http_getter(url, api_key, retry_config);
+		}
+	}
+
 	HttpResponse result;
 	result.status_code = 0;
 

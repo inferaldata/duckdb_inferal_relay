@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include <functional>
 #include <string>
 
 namespace duckdb {
@@ -24,6 +25,15 @@ struct RetryConfig {
 //! exponential backoff and jitter.
 HttpResponse HttpGet(const string &url, const string &api_key = "",
                      const RetryConfig &retry_config = RetryConfig{});
+
+//! Function type for pluggable HTTP GET implementations.
+using HttpGetFn = std::function<HttpResponse(const string &, const string &, const RetryConfig &)>;
+
+//! Replace the default HTTP getter with a custom implementation.
+void SetHttpGetter(HttpGetFn fn);
+
+//! Restore the default (httplib-based) HTTP getter.
+void ResetHttpGetter();
 
 } // namespace inferal_relay
 } // namespace duckdb

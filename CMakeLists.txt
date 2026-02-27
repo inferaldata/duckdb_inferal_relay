@@ -34,6 +34,7 @@ set(EXTENSION_SOURCES
     src/context.cpp
     src/members.cpp
     src/sync.cpp
+    src/mock_http.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
